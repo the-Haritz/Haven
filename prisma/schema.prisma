@@ -1,0 +1,53 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique // Simple identifier for the MVP
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  wallets   Wallet[]
+  ledger    Ledger[]
+}
+
+model Wallet {
+  id             String   @id @default(uuid())
+  userId         String
+  address        String   @unique
+  derivationIndex Int      @unique // The 'x' in m/44'/60'/0'/0/x
+  createdAt      DateTime @default(now())
+
+  user           User     @relation(fields: [userId], references: [id])
+}
+
+// Internal accounting. Append-only is best practice, but for MVP we might just update balances.
+// Let's do a transactional ledger (append-only) for robustness.
+model Ledger {
+  id        String   @id @default(uuid())
+  userId    String
+  amount    String   // Store as string to handle BigInt (wei) safely in SQLite
+  type      String   // 'DEPOSIT', 'WITHDRAWAL'
+  status    String   // 'PENDING', 'COMPLETED', 'FAILED'
+  txHash    String?  // Associated on-chain transaction if applicable
+  createdAt DateTime @default(now())
+
+  user      User     @relation(fields: [userId], references: [id])
+}
+
+// Tracking on-chain intents and statuses
+model Transaction {
+  id        String   @id @default(uuid())
+  txHash    String?  @unique
+  type      String   // 'WITHDRAWAL', 'SWEEP'
+  status    String   // 'PENDING', 'MINED', 'FAILED'
+  toAddress String
+  amount    String   // in wei
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
