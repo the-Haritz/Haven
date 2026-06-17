@@ -26,8 +26,8 @@ model Wallet {
   user           User     @relation(fields: [userId], references: [id])
 }
 
-// Internal accounting. Append-only is best practice, but for MVP we might just update balances.
-// Let's do a transactional ledger (append-only) for robustness.
+// Internal accounting. Append-only is best practice, but for MVP I might just update balances.
+// I'll do a transactional ledger (append-only) for robustness.
 model Ledger {
   id        String   @id @default(uuid())
   userId    String
