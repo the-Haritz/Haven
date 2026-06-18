@@ -24,11 +24,11 @@ I inject a single highly-secure Master Seed phrase via an environment variable (
 **Decision:** Using SQLite via Prisma for the MVP.
 **Why:** It drastically reduces the friction of getting the project running. No need to spin up Docker containers or configure Postgres locally. Prisma makes it trivial to swap the `provider` to PostgreSQL later if this moves to a real production environment.
 
-## 5. Deposit Indexing Architecture (RPC Log Filtering)
+## 5. Deposit Tracking Architecture (Webhooks over Custom Indexing)
 **Context:** To detect incoming deposits, the system needs to monitor the blockchain. The naive approach is polling every new block and iterating through all transactions.
-**Why I didn't use block polling:** It is highly inefficient, wastes RPC compute, and easily drops data if the server goes down or if network lag occurs.
-**Decision:** For this MVP, I assume the primary deposit asset is an ERC20 stablecoin (e.g., USDC), which is standard for fiat off-ramps. I am leveraging **RPC Log Filtering**. By subscribing to or polling for the ERC20 `Transfer` event (`eth_getLogs`) filtered by my generated user wallet addresses, the RPC node does the heavy lifting.
-**Benefit:** This provides a resilient, resource-efficient way to track deposits. To ensure no events are missed during server downtime, the indexer can fetch logs from the `lastProcessedBlock` stored in the database up to the `latest` block, guaranteeing exact-once processing.
+**Why I didn't use block polling or RPC Log Filtering:** Polling is highly inefficient and wastes RPC compute. While RPC Log Filtering (via WebSockets or `eth_getLogs`) is better, building a custom indexer for an MVP is a massive engineering overhead. It requires handling network re-orgs, connection drops, and state recovery to ensure exact-once processing.
+**Decision:** For this MVP, I am utilizing a **Webhook Architecture** (simulating a provider like Alchemy Notify or QuickNode Webhooks). The system exposes a `POST /webhooks/deposits` endpoint. We register our generated user addresses with the infrastructure provider, and they send an HTTP POST payload directly to our backend when a transfer occurs.
+**Benefit:** This approach delegates the complex infrastructure of blockchain node maintenance and event filtering to a specialized third party. It provides instant notifications, automatic retries on failure (if our server returns a 500), and allows us to focus entirely on business logic (updating the internal ledger). To ensure data integrity, the webhook endpoint implements an idempotency check against the `txHash` to prevent double-counting if the provider sends the same event twice.
 
 ## 6. Ledger Balance Calculation (In-Memory BigInt Math)
 **Context:** I need to expose an endpoint (`GET /users/:id/balance`) for users to view their total internal balance.
