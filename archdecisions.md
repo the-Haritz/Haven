@@ -23,3 +23,19 @@ I inject a single highly-secure Master Seed phrase via an environment variable (
 ## 4. Database Choice: SQLite
 **Decision:** Using SQLite via Prisma for the MVP.
 **Why:** It drastically reduces the friction of getting the project running. No need to spin up Docker containers or configure Postgres locally. Prisma makes it trivial to swap the `provider` to PostgreSQL later if this moves to a real production environment.
+
+## 5. Deposit Indexing Architecture (RPC Log Filtering)
+**Context:** To detect incoming deposits, the system needs to monitor the blockchain. The naive approach is polling every new block and iterating through all transactions.
+**Why I didn't use block polling:** It is highly inefficient, wastes RPC compute, and easily drops data if the server goes down or if network lag occurs.
+**Decision:** For this MVP, I assume the primary deposit asset is an ERC20 stablecoin (e.g., USDC), which is standard for fiat off-ramps. I am leveraging **RPC Log Filtering**. By subscribing to or polling for the ERC20 `Transfer` event (`eth_getLogs`) filtered by my generated user wallet addresses, the RPC node does the heavy lifting.
+**Benefit:** This provides a resilient, resource-efficient way to track deposits. To ensure no events are missed during server downtime, the indexer can fetch logs from the `lastProcessedBlock` stored in the database up to the `latest` block, guaranteeing exact-once processing.
+
+## 6. Ledger Balance Calculation (In-Memory BigInt Math)
+**Context:** I need to expose an endpoint (`GET /users/:id/balance`) for users to view their total internal balance.
+**Decision:** Instead of asking SQLite to `SUM()` the `amount` column natively, I pull all `COMPLETED` ledger entries for the user and calculate the sum using JavaScript's native `BigInt` inside a loop.
+**Why:** Because I store 256-bit wei/gwei amounts as strings (see Decision 1), standard SQLite `SUM` aggregates would treat them as floats or hit overflow limits, resulting in corrupt data. Pulling the strings into the Node runtime and doing explicit `BigInt` addition/subtraction guarantees mathematical safety. For an MVP, the number of ledger entries per user is small enough that pulling them into memory is negligible. In a high-scale environment with massive ledger history, we would introduce daily/weekly "balance snapshots" to avoid summing the entire history on every read.
+
+## 7. Propagating Prisma Transactions
+**Context:** When a user is created (`POST /users`), we create both a `User` record and a `Wallet` record. We want this to be atomic—if the wallet generation fails, the user shouldn't be created.
+**Decision:** We wrap the operation in `prisma.$transaction`. We explicitly pass the injected `tx` (transaction client) from the API layer down into the `WalletService.createWalletForUser` method.
+**Why:** Originally, `WalletService` was hardcoded to use the global `prisma` client. Calling a service that uses the global client from inside a `$transaction` block meant the service call was executing outside the bounds of the transaction. If the transaction aborted, the wallet might still be committed. Propagating `tx` ensures the entire flow shares the same database lock/session, preventing orphaned records.
