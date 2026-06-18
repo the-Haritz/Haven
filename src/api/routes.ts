@@ -1,9 +1,34 @@
 import { Router } from 'express';
+import { createWalletClient, http } from 'viem';
+import { privateKeyToAccount } from 'viem/accounts';
+import { baseSepolia } from 'viem/chains';
 import { prisma } from '../infrastructure/db';
 import { WalletService } from '../usecases/WalletService';
 
 export const routes = Router();
 const walletService = new WalletService();
+
+// Simple in-memory execution lock to prevent Hot Wallet nonce collisions 
+// during concurrent withdrawal requests.
+class Mutex {
+  private mutex = Promise.resolve();
+  lock(): Promise<() => void> {
+    let begin: (unlock: () => void) => void = () => {};
+    this.mutex = this.mutex.then(() => new Promise(begin));
+    return new Promise(res => { begin = res; });
+  }
+}
+const withdrawalMutex = new Mutex();
+
+// Hot Wallet setup for withdrawals
+// Fallback key provided for the MVP environment
+const HOT_WALLET_PRIVATE_KEY = process.env.HOT_WALLET_PRIVATE_KEY || '0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80';
+const hotWalletAccount = privateKeyToAccount(HOT_WALLET_PRIVATE_KEY as `0x${string}`);
+const hotWalletClient = createWalletClient({
+    account: hotWalletAccount,
+    chain: baseSepolia,
+    transport: http(process.env.RPC_URL || 'https://sepolia.base.org')
+});
 
 routes.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
@@ -145,5 +170,104 @@ routes.post('/webhooks/deposits', async (req, res, next) => {
     console.error('Webhook processing error:', error);
     // Return 500 so the infrastructure provider knows to retry the webhook later
     res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+/**
+ * Initiates a withdrawal from the user's internal ledger to an external network address.
+ */
+routes.post('/withdraw', async (req, res, next) => {
+  try {
+    const { userId, amount, toAddress } = req.body;
+
+    if (!userId || !amount || !toAddress) {
+      res.status(400).json({ error: 'userId, amount, and toAddress are required' });
+      return;
+    }
+
+    const withdrawAmount = BigInt(amount);
+    if (withdrawAmount <= 0n) {
+      res.status(400).json({ error: 'Amount must be greater than 0' });
+      return;
+    }
+
+    // 1. Calculate Balance (Using our BigInt logic)
+    const ledgerEntries = await prisma.ledger.findMany({
+      where: { userId, status: 'COMPLETED' },
+    });
+
+    let balance = 0n;
+    for (const entry of ledgerEntries) {
+      if (entry.type === 'DEPOSIT') balance += BigInt(entry.amount);
+      else if (entry.type === 'WITHDRAWAL') balance -= BigInt(entry.amount);
+    }
+
+    if (balance < withdrawAmount) {
+      res.status(400).json({ error: 'Insufficient balance' });
+      return;
+    }
+
+    // 2. Insert PENDING Withdrawal (Immediately locks funds internally)
+    const ledgerRecord = await prisma.ledger.create({
+      data: {
+        userId,
+        amount: withdrawAmount.toString(),
+        type: 'WITHDRAWAL',
+        status: 'PENDING',
+      }
+    });
+
+    // 3. Broadcast Tx with Execution Lock
+    // We use a mutex to ensure that concurrent requests do not cause the Hot Wallet 
+    // to calculate the exact same nonce, resulting in dropped transactions.
+    const unlock = await withdrawalMutex.lock();
+    let txHash: string;
+    
+    try {
+        txHash = await hotWalletClient.sendTransaction({
+            to: toAddress as `0x${string}`,
+            value: withdrawAmount,
+            // Gas is automatically estimated by Viem
+        });
+    } catch (error) {
+        unlock();
+        // If broadcast fails, we must unlock the user's funds so they can try again.
+        await prisma.ledger.update({
+            where: { id: ledgerRecord.id },
+            data: { status: 'FAILED' }
+        });
+        console.error('Withdrawal failed to broadcast:', error);
+        res.status(500).json({ error: 'Failed to broadcast transaction to the network' });
+        return;
+    }
+    unlock();
+
+    // 4. Save Hash and return 202 Accepted
+    await prisma.ledger.update({
+        where: { id: ledgerRecord.id },
+        data: { txHash }
+    });
+
+    await prisma.transaction.create({
+        data: {
+            txHash,
+            type: 'WITHDRAWAL',
+            status: 'PENDING',
+            toAddress,
+            amount: withdrawAmount.toString()
+        }
+    });
+
+    // Returning 202 shifts the tracking burden to the block explorer for the MVP,
+    // avoiding a frozen UI or the need for a complex polling worker.
+    res.status(202).json({
+        status: 'PENDING',
+        message: 'Withdrawal broadcasted to network',
+        txHash,
+        explorerUrl: `https://sepolia.basescan.org/tx/${txHash}`
+    });
+
+  } catch (error) {
+    next(error);
   }
 });
