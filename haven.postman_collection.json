@@ -1,0 +1,213 @@
+{
+	"info": {
+		"_postman_id": "673f4e2b-7b0b-4ebc-b3b3-f09b5585b46e",
+		"name": "Haven Crypto-to-Fiat MVP Backend",
+		"description": "API collection for testing the Haven Crypto-to-Fiat MVP backend. This includes endpoints for user creation, deposits simulation, balance checking, transaction history, and withdrawals on Base Sepolia.",
+		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+	},
+	"item": [
+		{
+			"name": "Health Check",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/api/health",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"health"
+					]
+				},
+				"description": "Check if the server is up and running."
+			},
+			"response": []
+		},
+		{
+			"name": "Create User",
+			"event": [
+				{
+					"listen": "test",
+					"script": {
+						"exec": [
+							"const jsonData = pm.response.json();",
+							"if (jsonData.user && jsonData.user.id) {",
+							"    pm.environment.set(\"userId\", jsonData.user.id);",
+							"}",
+							"if (jsonData.wallet && jsonData.wallet.address) {",
+							"    pm.environment.set(\"userAddress\", jsonData.wallet.address);",
+							"}"
+						],
+						"type": "text/javascript"
+					}
+				}
+			],
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"email\": \"alice@example.com\"\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/api/users",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"users"
+					]
+				},
+				"description": "Creates a new user and automatically derives their unique BIP-44 deposit address. Saves the user ID and address as Postman environment variables."
+			},
+			"response": []
+		},
+		{
+			"name": "Simulate Deposit (Webhook)",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"event\": {\n        \"activity\": [\n            {\n                \"toAddress\": \"{{userAddress}}\",\n                \"value\": \"1000000000000000000\",\n                \"hash\": \"0xabc1230000000000000000000000000000000000000000000000000000000001\"\n            }\n        ]\n    }\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/api/webhooks/deposits",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"webhooks",
+						"deposits"
+					]
+				},
+				"description": "Simulates an Alchemy or QuickNode webhook call notifying the backend that native token has been deposited into the user's derived address."
+			},
+			"response": []
+		},
+		{
+			"name": "Check User Balance",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/api/users/{{userId}}/balance",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"users",
+						"{{userId}}",
+						"balance"
+					]
+				},
+				"description": "Returns the user's available balance in Wei (computed as: completed deposits - completed withdrawals - pending withdrawals)."
+			},
+			"response": []
+		},
+		{
+			"name": "View Transaction History",
+			"request": {
+				"method": "GET",
+				"header": [],
+				"url": {
+					"raw": "{{baseUrl}}/api/users/{{userId}}/transactions",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"users",
+						"{{userId}}",
+						"transactions"
+					]
+				},
+				"description": "Retrieves the historical ledger records for the user."
+			},
+			"response": []
+		},
+		{
+			"name": "Withdraw Funds",
+			"request": {
+				"method": "POST",
+				"header": [
+					{
+						"key": "Content-Type",
+						"value": "application/json",
+						"type": "text"
+					}
+				],
+				"body": {
+					"mode": "raw",
+					"raw": "{\n    \"userId\": \"{{userId}}\",\n    \"amount\": \"500000000000000000\",\n    \"toAddress\": \"0x70997970C51812dc3A010C7d01b50e0d17dc79C8\"\n}"
+				},
+				"url": {
+					"raw": "{{baseUrl}}/api/withdraw",
+					"host": [
+						"{{baseUrl}}"
+					],
+					"path": [
+						"api",
+						"withdraw"
+					]
+				},
+				"description": "Initiates a withdrawal from the internal balance to an external recipient address, executed via the Hot Wallet."
+			},
+			"response": []
+		}
+	],
+	"event": [
+		{
+			"listen": "prerequest",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		},
+		{
+			"listen": "test",
+			"script": {
+				"type": "text/javascript",
+				"exec": [
+					""
+				]
+			}
+		}
+	],
+	"variable": [
+		{
+			"key": "baseUrl",
+			"value": "http://localhost:3000",
+			"type": "string"
+		},
+		{
+			"key": "userId",
+			"value": "user-uuid-placeholder",
+			"type": "string"
+		},
+		{
+			"key": "userAddress",
+			"value": "0x0000000000000000000000000000000000000000",
+			"type": "string"
+		}
+	]
+}
