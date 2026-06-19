@@ -52,3 +52,34 @@ I inject a single highly-secure Master Seed phrase via an environment variable (
 **Decision 1: Immediate Internal Locking.** Before any RPC calls are made, the requested amount is deducted from the internal ledger as a `PENDING` transaction. If the RPC broadcast fails, the ledger entry is explicitly reverted to `FAILED` to unlock the funds. This prevents the classic "double-spend API race condition."
 **Decision 2: In-Memory Mutex for Nonce Bottleneck.** If two users request a withdrawal at the exact same millisecond, the Hot Wallet client will calculate the same `nonce` for both transactions, causing one to drop. For the MVP, I implemented an in-memory `Mutex` lock around the `sendTransaction` call. This queues concurrent withdrawals locally, forcing them to process sequentially so the RPC node correctly increments the nonce.
 **Decision 3: 202 Accepted Status.** Instead of blocking the HTTP request until the transaction is mined (which can take minutes and cause server timeouts), the API immediately returns a `202 Accepted` status with the transaction hash and a Block Explorer URL once the transaction is broadcast to the mempool. This shifts the state-tracking burden to the block explorer, providing a clean UX without requiring complex background polling workers for the MVP.
+
+## 10. Available Balance: Locking PENDING Withdrawals
+**Context:** I originally calculated balance by only summing `COMPLETED` ledger entries. But withdrawals start as `PENDING` — which means they weren't being subtracted from the user's balance until after they were confirmed. This opened a double-spend window: a user could fire off multiple concurrent withdrawal requests, all of which would pass the balance check because PENDING entries were invisible.
+**Decision:** The `getAvailableBalance()` method now subtracts both `COMPLETED` and `PENDING` withdrawals. `FAILED` withdrawals are NOT subtracted (those funds are unlocked). This is the standard "available balance" pattern used by banks and exchanges — funds are locked the moment an intent is created, not when it's confirmed.
+**Trade-off:** If a withdrawal is broadcast but the server crashes before marking it `COMPLETED`, those funds stay locked as `PENDING` indefinitely. In production, I'd add a reconciliation worker that checks on-chain status of old `PENDING` entries and resolves them. For the MVP, this is an acceptable edge case.
+
+## 11. Structured Logging (Winston over console.log)
+**Context:** I had Winston installed as a dependency from day one but was still using `console.log` everywhere. For a crypto backend handling real money, this is a problem — when something goes wrong at 3am, I need to be able to filter logs by `userId`, `txHash`, or `walletAddress` to reconstruct exactly what happened.
+**Decision:** I replaced all `console.log/error` calls with a centralized Winston logger. The logger outputs human-readable colorized text in development and structured JSON in production (for log aggregators like Datadog, ELK, or CloudWatch).
+**Benefit:** Every log entry now carries contextual metadata (userId, txHash, amounts, timing), making it trivial to trace a single transaction's lifecycle across the entire system. The `requestLogger` middleware also logs every HTTP request with method, path, status code, and response time.
+
+## 12. Error Handling Architecture (Custom Error Classes)
+**Context:** Before this refactor, errors were thrown as generic `Error` objects or caught with inline `res.status(xxx).json()` calls scattered across route handlers. The global error handler had no way to distinguish between "the user sent a bad request" and "the database connection dropped."
+**Decision:** I built a custom error hierarchy rooted in `AppError`:
+- `ValidationError` (400) — bad input from the client
+- `NotFoundError` (404) — requested resource doesn't exist
+- `InsufficientFundsError` (400) — balance too low for withdrawal
+- `BlockchainError` (502) — upstream RPC/broadcast failure
+- `ConflictError` (409) — duplicate request
+
+Each error carries its own HTTP status code and an `isOperational` flag. The global error handler checks this flag: operational errors get their message sent to the client (it's safe, I wrote it), unexpected errors get a generic 500 with the full stack logged server-side (it might leak internals).
+
+## 13. Centralized Environment Configuration
+**Context:** I had `process.env.SOMETHING || 'fallback'` scattered across 5 different files — `routes.ts`, `viem.ts`, `sweeper.ts`, `WalletService.ts`. If I forgot to call `dotenv/config` in one of them (which I did — it was never imported anywhere), all the env vars were silently undefined and the fallbacks kicked in.
+**Decision:** I created a single `config.ts` module that:
+1. Imports `dotenv/config` as its very first line (guaranteeing .env is loaded)
+2. Validates all required environment variables at startup
+3. In production mode, throws immediately if a critical variable is missing or using an insecure default (like the Hardhat test key)
+4. Exports a frozen config object that every other module imports
+
+**Benefit:** Fail fast, fail loud. If the mnemonic is missing, the server won't start — much better than discovering at 3am that the sweeper has been deriving from a test seed against mainnet.
