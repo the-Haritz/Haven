@@ -109,3 +109,5 @@ dist
 # Prisma
 dev.db
 dev.db-journal
+test.db
+test.db-journal
