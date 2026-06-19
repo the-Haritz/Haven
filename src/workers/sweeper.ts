@@ -1,101 +1,147 @@
-import { parseEther, formatEther, createWalletClient, http } from 'viem';
+// Background worker to sweep funds from user deposit addresses to the hot wallet.
+// We consolidate funds to maintain hot wallet liquidity and minimize our EOA attack surface.
+// This is designed to run periodically (e.g. as a cron job). It sweeps wallets sequentially
+// and logs failures without crashing the whole process.
+//
+// Note: We only sweep native ETH for this MVP to avoid complex gas-funding dependencies for ERC-20s.
+
+import { config } from '../infrastructure/config';
+import { formatEther, parseEther, createWalletClient, http } from 'viem';
 import { baseSepolia } from 'viem/chains';
 import { prisma } from '../infrastructure/db';
 import { WalletService } from '../usecases/WalletService';
 import { publicClient } from '../infrastructure/viem';
+import { logger } from '../infrastructure/logger';
+import { TransactionType, TransactionStatus } from '../domain/types';
 
-// In a real app, this should be an environment variable.
-const HOT_WALLET_ADDRESS = process.env.HOT_WALLET_ADDRESS || '0x0000000000000000000000000000000000000000';
+const HOT_WALLET_ADDRESS = config.hotWalletAddress;
 
-// Do not attempt to sweep dust. If the balance is less than this, ignore it.
-const MIN_SWEEP_THRESHOLD = parseEther('0.005');
+// Skip low balance addresses so we don't burn all the ETH on gas fees
+const MIN_SWEEP_THRESHOLD = parseEther(config.minSweepThreshold);
 
 const walletService = new WalletService();
 
-async function sweep() {
-  console.log('🧹 Starting Sweeper Worker...');
+async function sweep(): Promise<void> {
+  logger.info('🧹 Starting Sweeper Worker...', {
+    hotWallet: HOT_WALLET_ADDRESS,
+    minThreshold: config.minSweepThreshold + ' ETH',
+  });
 
-  // 1. Fetch all user wallets from our database
-  // Note: For massive scale, this should be paginated or streamed.
+  // Load wallets from the DB.
+  // Note: For production scale, paginate or use a cursor.
   const wallets = await prisma.wallet.findMany();
+
+  logger.info(`Found ${wallets.length} wallets to check`);
+
+  let sweptCount = 0;
+  let skippedCount = 0;
 
   for (const wallet of wallets) {
     try {
-      // 2. Query the RPC for the *actual* on-chain ETH balance
-      // We don't rely on our internal ledger for this, because the ledger 
-      // tracks the user's platform balance, not the specific UTXO/EOA state.
-      const balance = await publicClient.getBalance({ address: wallet.address as `0x${string}` });
+      // Get actual on-chain balance (not our database record)
+      const balance = await publicClient.getBalance({
+        address: wallet.address as `0x${string}`,
+      });
 
       if (balance < MIN_SWEEP_THRESHOLD) {
-        // Skip dusting amounts
+        skippedCount++;
         continue;
       }
 
-      console.log(`Wallet ${wallet.address} has balance ${formatEther(balance)} ETH. Preparing sweep...`);
+      logger.info('Wallet has sweepable balance', {
+        address: wallet.address,
+        balance: formatEther(balance) + ' ETH',
+      });
 
-      // 3. Initialize the temporary signer for this specific user wallet
-      const account = await walletService.getSignerForWallet(wallet.derivationIndex);
+      // Get temporary memory account signer
+      const account = walletService.getSignerForWallet(wallet.derivationIndex);
 
-      // 4. Dynamic Gas Calculation (EIP-1559)
-      // A standard native ETH transfer is exactly 21,000 gas.
+      // EIP-1559 Dynamic Gas Calculation.
+      // Standard ETH transfer uses exactly 21,000 gas. We subtract total gas cost
+      // from the on-chain balance to figure out the final sweep amount.
       const gasLimit = 21000n;
       const feeData = await publicClient.estimateFeesPerGas();
-      
+
       const maxFeePerGas = feeData.maxFeePerGas || 0n;
       const maxPriorityFeePerGas = feeData.maxPriorityFeePerGas || 0n;
 
-      // Calculate the maximum possible fee we might pay
       const maxGasCost = gasLimit * maxFeePerGas;
-      
-      // The amount we send is the total balance MINUS the gas fee
       const sweepAmount = balance - maxGasCost;
 
       if (sweepAmount <= 0n) {
-          console.log(`Sweep amount too low after gas cost for ${wallet.address}. Skipping.`);
-          continue;
+        logger.warn('Balance too low after gas estimation, skipping', {
+          address: wallet.address,
+          balance: formatEther(balance) + ' ETH',
+          estimatedGas: formatEther(maxGasCost) + ' ETH',
+        });
+        skippedCount++;
+        continue;
       }
 
-      console.log(`Sweeping ${formatEther(sweepAmount)} ETH to Hot Wallet...`);
+      logger.info('Sweeping funds to Hot Wallet', {
+        address: wallet.address,
+        sweepAmount: formatEther(sweepAmount) + ' ETH',
+      });
 
-      // 5. Initialize Wallet Client to execute the transaction
+      // Set up a temporary wallet client using the user's derived key
       const walletClient = createWalletClient({
         account,
         chain: baseSepolia,
-        transport: http(process.env.RPC_URL || 'https://sepolia.base.org')
+        transport: http(config.rpcUrl),
       });
 
-      // 6. Broadcast Transaction
+      // Broadcast the sweep transaction
       const txHash = await walletClient.sendTransaction({
         to: HOT_WALLET_ADDRESS as `0x${string}`,
         value: sweepAmount,
         maxFeePerGas,
         maxPriorityFeePerGas,
-        gas: gasLimit
+        gas: gasLimit,
       });
 
-      console.log(`✅ Sweep transaction broadcasted: ${txHash}`);
+      logger.info('✅ Sweep transaction broadcasted', {
+        address: wallet.address,
+        txHash,
+        amount: formatEther(sweepAmount) + ' ETH',
+      });
 
-      // 7. Record the intent in our database
+      // Record in our transactions log for auditing
       await prisma.transaction.create({
         data: {
           txHash,
-          type: 'SWEEP',
-          status: 'PENDING',
+          type: TransactionType.SWEEP,
+          status: TransactionStatus.PENDING,
           toAddress: HOT_WALLET_ADDRESS,
-          amount: sweepAmount.toString()
-        }
+          amount: sweepAmount.toString(),
+        },
       });
 
+      sweptCount++;
+
     } catch (error) {
-      console.error(`❌ Error sweeping wallet ${wallet.address}:`, error);
+      // Keep going if a single wallet sweep fails (network lag, gas fluctuations, etc.)
+      const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+      logger.error('Failed to sweep wallet', {
+        address: wallet.address,
+        error: errorMessage,
+      });
     }
   }
 
-  console.log('Sweeper Worker finished.');
+  logger.info('Sweeper Worker finished', {
+    totalWallets: wallets.length,
+    swept: sweptCount,
+    skipped: skippedCount,
+  });
 }
 
-// Execute the sweeper
-sweep().then(() => process.exit(0)).catch(e => {
-    console.error('Fatal Sweeper Error:', e);
+// Auto run when script is called
+sweep()
+  .then(() => process.exit(0))
+  .catch((error) => {
+    logger.error('Fatal Sweeper Error', {
+      error: error instanceof Error ? error.message : 'Unknown error',
+      stack: error instanceof Error ? error.stack : undefined,
+    });
     process.exit(1);
-});
+  });
