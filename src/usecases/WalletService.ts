@@ -1,58 +1,77 @@
+// WalletService derives user deposit addresses on the fly using BIP-39/BIP-44 HD Wallets.
+// We load a single master mnemonic from the config and derive unique accounts.
+//
+// Security:
+// We never store private keys in the database. Instead, we only store the public address
+// and its derivation index. If the database leaks, keys are safe. We temporarily derive
+// private keys in memory only when we need to sweep funds.
+
 import { mnemonicToAccount } from 'viem/accounts';
-import { Prisma } from '@prisma/client';
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../infrastructure/db';
+import { config } from '../infrastructure/config';
+import { logger } from '../infrastructure/logger';
 
 export class WalletService {
   private masterMnemonic: string;
 
   constructor() {
-    // In production, this should throw if missing. For MVP dev, we can provide a fallback.
-    this.masterMnemonic = process.env.MASTER_MNEMONIC || 'test test test test test test test test test test test junk';
-    
-    // enforce english language for mnemonic parsing as standard
-    if (this.masterMnemonic.split(' ').length < 12) {
-      throw new Error("Invalid MASTER_MNEMONIC. Must be at least 12 words.");
+    this.masterMnemonic = config.masterMnemonic;
+
+    // Mnemonic must have at least 12 words to be valid BIP-39
+    const wordCount = this.masterMnemonic.split(' ').length;
+    if (wordCount < 12) {
+      throw new Error(
+        `Invalid MASTER_MNEMONIC: expected at least 12 words, got ${wordCount}.`
+      );
     }
   }
 
-  /**
-   * Derives a new deposit address for a user and saves it to the database.
-   */
+  // Generates a new deposit address and records it.
+  // Supports an optional transaction client to make user registration atomic.
   async createWalletForUser(userId: string, tx?: Prisma.TransactionClient) {
     const db = tx || prisma;
 
-    // 1. Find the highest derivation index currently in the database to know what's next
+    // Find the next derivation index.
+    // Note: In a high-concurrency app, you'd use a DB sequence or lock to avoid index conflicts.
     const lastWallet = await db.wallet.findFirst({
       orderBy: { derivationIndex: 'desc' },
     });
 
     const nextIndex = lastWallet ? lastWallet.derivationIndex + 1 : 0;
 
-    // 2. Derive the account in memory using Viem
-    // By default, mnemonicToAccount uses the standard Ethereum path: m/44'/60'/0'/0/${addressIndex}
-    const account = mnemonicToAccount(this.masterMnemonic, { addressIndex: nextIndex });
+    // Standard derivation path: m/44'/60'/0'/0/{index}
+    const account = mnemonicToAccount(this.masterMnemonic, {
+      addressIndex: nextIndex,
+    });
 
-    // 3. Save the public info to the database
+    // Normalize address to lowercase to avoid case-matching headaches later
     const wallet = await db.wallet.create({
       data: {
         userId,
-        address: account.address,
+        address: account.address.toLowerCase(),
         derivationIndex: nextIndex,
       },
     });
 
+    logger.info('Wallet created for user', {
+      userId,
+      address: wallet.address,
+      derivationIndex: nextIndex,
+    });
+
     return {
-        id: wallet.id,
-        address: wallet.address,
-        derivationIndex: wallet.derivationIndex
+      id: wallet.id,
+      address: wallet.address,
+      derivationIndex: wallet.derivationIndex,
     };
   }
 
-  /**
-   * Retrieves the temporary signer (private key) for a specific user's wallet.
-   * THIS IS DANGEROUS. ONLY USE IN THE SWEEPER/WITHDRAWAL WORKER.
-   */
-  async getSignerForWallet(derivationIndex: number) {
-    return mnemonicToAccount(this.masterMnemonic, { addressIndex: derivationIndex });
+  // Helper to get the actual signer for a wallet by its index.
+  // Used by the sweeper to sign transactions. Keeps the private key in memory temporarily.
+  getSignerForWallet(derivationIndex: number) {
+    return mnemonicToAccount(this.masterMnemonic, {
+      addressIndex: derivationIndex,
+    });
   }
 }
